@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-watch.py — send a push notification via ntfy.sh when a file is written to.
+watch.py — send a push notification via ntfy.sh when a file is created or
+modified inside a folder.
 
 Usage:
-    python watch.py <file_path> <ntfy_topic>
+    python watch.py <folder_path> <ntfy_topic>
 
 Example:
-    python watch.py "C:\\logs\\import.log" my-import-log-abc123
+    python watch.py "C:\\Users\\me\\Downloads" my-downloads-abc123
 """
 
 import os
@@ -24,71 +25,76 @@ except ImportError:
 
 
 NTFY_SERVER = "https://ntfy.sh"
-COOLDOWN_SECONDS = 30   # minimum seconds between notifications (prevents spam on rapid writes)
-TAIL_LINES = 5          # how many trailing log lines to include in the notification
+COOLDOWN_SECONDS = 30   # minimum seconds between alerts for the same file (prevents spam on rapid writes)
 
 
-def tail(filepath, n):
-    """Return the last n lines of a file without loading it all into memory."""
-    try:
-        with open(filepath, "rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            buf = b""
-            chunk = 4096
-            lines_found = 0
-            pos = size
-            while pos > 0 and lines_found <= n:
-                read = min(chunk, pos)
-                pos -= read
-                f.seek(pos)
-                buf = f.read(read) + buf
-                lines_found = buf.count(b"\n")
-            lines = buf.decode(errors="replace").splitlines()
-            return "\n".join(lines[-n:]) if lines else ""
-    except OSError:
-        return ""
-
-
-class LogFileHandler(FileSystemEventHandler):
-    def __init__(self, filepath, ntfy_topic):
-        self.filepath = os.path.abspath(filepath)
+class FolderHandler(FileSystemEventHandler):
+    def __init__(self, folder, ntfy_topic):
+        self.folder = os.path.abspath(folder)
         self.ntfy_topic = ntfy_topic
-        self._last_notified = 0.0
+        self._last_notified = {}   # per-file path -> last notified timestamp
+        self._dirs = self._scan_dirs()   # immediate subdirs, to spot dir deletes
+
+    def _scan_dirs(self):
+        # On Windows a deleted entry reports is_directory=False (it's already
+        # gone), so we remember which immediate children are folders.
+        dirs = set()
+        try:
+            for name in os.listdir(self.folder):
+                full = os.path.join(self.folder, name)
+                if os.path.isdir(full):
+                    dirs.add(os.path.abspath(full))
+        except OSError:
+            pass
+        return dirs
+
+    def on_created(self, event):
+        if event.is_directory:
+            self._dirs.add(os.path.abspath(event.src_path))
+            return
+        self._handle(event.src_path, "New file")
 
     def on_modified(self, event):
         if event.is_directory:
             return
-        if os.path.abspath(event.src_path) != self.filepath:
-            return
+        self._handle(event.src_path, "File modified")
 
+    def on_deleted(self, event):
+        path = os.path.abspath(event.src_path)
+        if event.is_directory or path in self._dirs:
+            self._dirs.discard(path)
+            return
+        self._handle(event.src_path, "File deleted")
+
+    def _handle(self, src_path, action):
+        path = os.path.abspath(src_path)
         now = time.time()
-        if now - self._last_notified < COOLDOWN_SECONDS:
+        if now - self._last_notified.get(path, 0.0) < COOLDOWN_SECONDS:
             return
-        self._last_notified = now
+        self._last_notified[path] = now
+        self._send_notification(path, action)
 
-        self._send_notification()
-
-    def _send_notification(self):
+    def _send_notification(self, path, action):
         timestamp = time.strftime("%H:%M:%S")
-        last_lines = tail(self.filepath, TAIL_LINES)
-        filename = os.path.basename(self.filepath)
-
-        body = f"Written at {timestamp}\n\n{last_lines}" if last_lines else f"Written at {timestamp}"
+        filename = os.path.basename(path)
+        tags = {"New file": "sparkles",
+                "File modified": "pencil2",
+                "File deleted": "wastebasket"}.get(action, "bell")
+        body = f"{action} at {timestamp}\n\n{path}"
 
         try:
             req = urllib.request.Request(
                 f"{NTFY_SERVER}/{self.ntfy_topic}",
                 data=body.encode(),
                 headers={
-                    "Title": f"{filename} was written to",
+                    "Title": f"{action}: {filename}",
                     "Priority": "high",
-                    "Tags": "warning,page_facing_up",
+                    "Tags": tags,
                 },
                 method="POST",
             )
             urllib.request.urlopen(req, timeout=10)
-            print(f"[{timestamp}] Notification sent.")
+            print(f"[{timestamp}] {action}: {filename} — notification sent.")
         except urllib.error.URLError as e:
             print(f"[{timestamp}] Failed to send notification: {e}")
 
@@ -98,20 +104,19 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    filepath = sys.argv[1]
+    folder = sys.argv[1]
     ntfy_topic = sys.argv[2]
 
-    if not os.path.isfile(filepath):
-        print(f"File not found: {filepath}")
+    if not os.path.isdir(folder):
+        print(f"Folder not found: {folder}")
         sys.exit(1)
 
-    watch_dir = os.path.dirname(os.path.abspath(filepath)) or "."
-    handler = LogFileHandler(filepath, ntfy_topic)
+    handler = FolderHandler(folder, ntfy_topic)
     observer = Observer()
-    observer.schedule(handler, path=watch_dir, recursive=False)
+    observer.schedule(handler, path=folder, recursive=False)
     observer.start()
 
-    print(f"Watching : {filepath}")
+    print(f"Watching : {folder}")
     print(f"Notify   : {NTFY_SERVER}/{ntfy_topic}")
     print(f"Cooldown : {COOLDOWN_SECONDS}s between alerts")
     print("Press Ctrl+C to stop.\n")
