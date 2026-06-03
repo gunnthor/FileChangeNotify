@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import sys
+import ssl
 import time
 import threading
 import urllib.request
@@ -16,8 +17,18 @@ except ImportError:
     messagebox.showerror("Missing dependency", "Run:\n\n  pip install pyodbc")
     sys.exit(1)
 
+# Verify TLS against the OS (Windows) certificate store so connections work
+# behind a corporate TLS-inspecting proxy whose root CA is trusted by Windows
+# but not by Python's bundled CA bundle. Optional — degrades gracefully.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+    _OS_TRUST = True
+except Exception:
+    _OS_TRUST = False
 
-VERSION = "v1.2.1"
+
+VERSION = "v1.2.2"
 AUTHOR = "Gunnthor"
 NTFY_SERVER = "https://ntfy.sh"
 COOLDOWN_SECONDS = 30          # minimum seconds between notifications
@@ -124,14 +135,19 @@ def detect_identity_column(cur, schema, table):
     return row[0] if row else None
 
 
-def send_ntfy(topic, title, body, tags):
+def send_ntfy(topic, title, body, tags, insecure=False):
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{topic}",
         data=body.encode(),
         headers={"Title": title, "Priority": "high", "Tags": tags},
         method="POST",
     )
-    urllib.request.urlopen(req, timeout=10)
+    ctx = None
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    urllib.request.urlopen(req, timeout=10, context=ctx)
 
 
 class MonitorError(Exception):
@@ -141,7 +157,7 @@ class MonitorError(Exception):
 # ── Polling monitor (runs on a worker thread) ────────────────────────────
 class SqlMonitor:
     def __init__(self, server, database, schema, table, topic, interval,
-                 trust_cert, key_column, log_cb, done_cb):
+                 trust_cert, key_column, log_cb, done_cb, insecure_tls=False):
         self.server = server
         self.database = database
         self.schema_in = schema
@@ -152,6 +168,7 @@ class SqlMonitor:
         self.key_in = key_column
         self.log_cb = log_cb
         self.done_cb = done_cb
+        self.insecure_tls = insecure_tls
 
         self._stop = threading.Event()
         self.stopped_by_user = False
@@ -306,7 +323,7 @@ class SqlMonitor:
         title = f"New rows in {self.schema}.{self.table}"
         body = f"{n} new row(s) in {self.schema}.{self.table} at {ts}\n\n{detail}"
         try:
-            send_ntfy(self.topic, title, body, "inbox_tray")
+            send_ntfy(self.topic, title, body, "inbox_tray", self.insecure_tls)
             self.log_cb(f"[{ts}] {n} new row(s) — notification sent.")
         except urllib.error.URLError as e:
             self.log_cb(f"[{ts}] Failed to send: {e}")
@@ -362,6 +379,7 @@ class App(tk.Tk):
         self.topic_var = tk.StringVar()
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL))
         self.trust_var = tk.BooleanVar(value=True)
+        self.insecure_var = tk.BooleanVar(value=False)
 
         field(0, "SQL Server  (e.g. localhost or .\\SQLEXPRESS)", self.server_var)
         field(2, "Database", self.db_var)
@@ -369,20 +387,28 @@ class App(tk.Tk):
         field(6, "Key column  (optional — auto-detects identity)", self.key_var)
         field(8, "ntfy subscription", self.topic_var)
 
-        # ── Options row: poll interval + trust certificate ──────────────
+        # ── Options: poll interval + TLS choices ────────────────────────
         opts = tk.Frame(body, bg=BG)
         opts.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(14, 0))
-        tk.Label(opts, text="Poll every", font=("Segoe UI", 9), bg=BG,
+
+        line1 = tk.Frame(opts, bg=BG)
+        line1.pack(fill="x", anchor="w")
+        tk.Label(line1, text="Poll every", font=("Segoe UI", 9), bg=BG,
                  fg=LABEL_FG).pack(side="left")
-        tk.Entry(opts, textvariable=self.interval_var, width=5,
+        tk.Entry(line1, textvariable=self.interval_var, width=5,
                  font=("Segoe UI", 9), relief="solid", bd=1, justify="center").pack(
                      side="left", padx=(6, 4))
-        tk.Label(opts, text="seconds", font=("Segoe UI", 9), bg=BG,
+        tk.Label(line1, text="seconds", font=("Segoe UI", 9), bg=BG,
                  fg=LABEL_FG).pack(side="left")
-        tk.Checkbutton(opts, text="Trust server certificate (local/self-signed)",
+
+        tk.Checkbutton(opts, text="Trust SQL Server certificate (local/self-signed)",
                        variable=self.trust_var, bg=BG, fg=LABEL_FG,
                        activebackground=BG, font=("Segoe UI", 9),
-                       anchor="w").pack(side="right")
+                       anchor="w").pack(fill="x", anchor="w", pady=(6, 0))
+        tk.Checkbutton(opts, text="Ignore certificate errors when sending (corporate TLS proxy)",
+                       variable=self.insecure_var, bg=BG, fg=LABEL_FG,
+                       activebackground=BG, font=("Segoe UI", 9),
+                       anchor="w").pack(fill="x", anchor="w")
 
         # ── Guide box ───────────────────────────────────────────────────
         guide_frame = tk.Frame(body, bg=GUIDE_BG, highlightbackground=GUIDE_BORDER,
@@ -463,14 +489,20 @@ class App(tk.Tk):
             return
 
         schema, tbl = split_table(table)
+        insecure = self.insecure_var.get()
         self.monitor = SqlMonitor(
             server, database, schema, tbl, topic, interval,
-            self.trust_var.get(), key, self._log_from_thread, self._on_monitor_exit)
+            self.trust_var.get(), key, self._log_from_thread, self._on_monitor_exit,
+            insecure_tls=insecure)
         self.thread = threading.Thread(target=self.monitor.run, daemon=True)
         self.thread.start()
 
         self._append(f"Monitoring: {schema}.{tbl} on {server}/{database}")
         self._append(f"Notifying:  {NTFY_SERVER}/{topic}  (every {interval}s)")
+        if insecure:
+            self._append("TLS: certificate verification OFF for sending.")
+        else:
+            self._append(f"TLS: verifying via {'OS trust store' if _OS_TRUST else 'bundled CA store'}.")
         self.btn.config(text="Stop Monitoring", bg=BTN_STOP_BG,
                         activebackground="#b91c1c")
 

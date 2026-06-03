@@ -90,6 +90,8 @@ pyinstaller --onefile --windowed --name SqlRowNotifier sql_app.py
 
 > **Note on `TrustServerCertificate`:** keeping it checked is fine for a local instance with a self-signed certificate (traffic is still encrypted). For production, install a trusted certificate and uncheck it.
 
+> **Behind a corporate proxy?** Notifications go to `https://ntfy.sh`. If your network does TLS inspection, the app verifies against the **Windows certificate store** (via `truststore`), so a corporate root CA already trusted by Windows just works. If sending still fails with a certificate error, tick **"Ignore certificate errors when sending"** as a fallback.
+
 ### Quick test
 
 ```sql
