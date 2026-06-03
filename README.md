@@ -54,17 +54,67 @@ pyinstaller --onefile --windowed --name FileChangeNotifier app.py
 
 ---
 
+## SQL Row Notifier (companion app)
+
+A second GUI app, `sql_app.py`, watches a **table in a local SQL Server database** and sends a push notification whenever **new rows are inserted** — handy when another system writes records into a table and you want to know the moment they land.
+
+### How it works
+
+1. It connects to your SQL Server using **Windows authentication** and polls the table on an interval (default 30s).
+2. It auto-detects the table's **IDENTITY** column and tracks its highest value, so it can report exactly how many new rows arrived (and the latest key). If the table has no identity column, it falls back to watching the row count.
+3. The first read just establishes a baseline — you won't get an alert until *new* rows actually appear.
+
+### Prerequisites
+
+- **SQL Server reachable** from this machine, with a login that has `SELECT` on the table (Windows auth).
+- **ODBC Driver 18 for SQL Server** installed — this is a system component and is **not** bundled into the exe. ([Microsoft download](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server))
+
+### Run it
+
+**GUI** — download `SqlRowNotifier.exe` from [Releases](../../releases) (or run `python sql_app.py`) and fill in:
+- **SQL Server** — e.g. `localhost`, `.\SQLEXPRESS`, or `MYHOST\INSTANCE`
+- **Database** and **Table** (`schema.table`, e.g. `dbo.Orders`)
+- **Key column** — optional; leave blank to auto-detect the identity column
+- **ntfy subscription** — the topic name you subscribed to
+- **Poll interval** and **Trust server certificate** (leave checked for a local/self-signed instance — Driver 18 encrypts by default)
+
+Hit **Start Monitoring** and leave the window open.
+
+### Build the SQL exe yourself
+
+```bash
+pip install -r requirements.txt pyinstaller
+pyinstaller --onefile --windowed --name SqlRowNotifier sql_app.py
+# Output: dist/SqlRowNotifier.exe
+```
+
+> **Note on `TrustServerCertificate`:** keeping it checked is fine for a local instance with a self-signed certificate (traffic is still encrypted). For production, install a trusted certificate and uncheck it.
+
+### Quick test
+
+```sql
+CREATE TABLE dbo.NotifyTest (Id INT IDENTITY PRIMARY KEY, Note NVARCHAR(50));
+-- Start the app against dbo.NotifyTest, then:
+INSERT INTO dbo.NotifyTest (Note) VALUES ('one'), ('two');
+-- Within one poll interval you should get a "2 new row(s) … Latest Id = 2" push.
+```
+
+---
+
 ## Configuration
 
 | Setting | Location | Default |
 |---------|----------|---------|
 | Cooldown between alerts (per file) | Top of `watch.py` / `app.py` | 30 seconds |
+| Cooldown between alerts (SQL) | Top of `sql_app.py` | 30 seconds |
+| SQL poll interval | `sql_app.py` field / `DEFAULT_INTERVAL` | 30 seconds |
 
 ---
 
 ## Requirements
 
-- Windows (exe) or Python 3.8+ with `watchdog` (cross-platform)
+- Windows (exe) or Python 3.8+ with `watchdog` (file notifier, cross-platform)
+- For the SQL Row Notifier: `pyodbc` + **ODBC Driver 18 for SQL Server**, and a reachable SQL Server (Windows auth)
 - Internet connection for ntfy notifications
 - ntfy app on your phone
 
