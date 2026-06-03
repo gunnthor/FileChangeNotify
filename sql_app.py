@@ -17,12 +17,25 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "v1.2.0"
+VERSION = "v1.2.1"
 AUTHOR = "Gunnthor"
 NTFY_SERVER = "https://ntfy.sh"
 COOLDOWN_SECONDS = 30          # minimum seconds between notifications
 DEFAULT_INTERVAL = 30          # seconds between polls
-ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
+
+# Preferred SQL Server ODBC drivers, best first. We use whichever is installed
+# so the app works on machines without the newest driver (e.g. an AX/D365 VM
+# that only has Driver 17 or the SQL Server Native Client).
+DRIVER_PREFERENCE = [
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+    "ODBC Driver 13.1 for SQL Server",
+    "ODBC Driver 13 for SQL Server",
+    "ODBC Driver 11 for SQL Server",
+    "SQL Server Native Client 11.0",
+    "SQL Server Native Client 10.0",
+    "SQL Server",
+]
 
 BG          = "#f1f5f9"
 HEADER_BG   = "#1e40af"
@@ -39,6 +52,18 @@ MUTED_FG    = "#6b7280"
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+def pick_driver():
+    """Return the best installed SQL Server ODBC driver, or None."""
+    available = pyodbc.drivers()
+    for d in DRIVER_PREFERENCE:
+        if d in available:
+            return d
+    for d in available:                 # any other SQL Server driver
+        if "SQL Server" in d:
+            return d
+    return None
+
+
 def quote_ident(name):
     """Bracket-quote a SQL identifier (replicates T-SQL QUOTENAME)."""
     return "[" + name.replace("]", "]]") + "]"
@@ -56,16 +81,20 @@ def split_table(text):
     return schema, table
 
 
-def build_conn_str(server, database, trust_cert):
-    """Windows-auth connection string for ODBC Driver 18."""
-    return (
-        f"DRIVER={{{ODBC_DRIVER}}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        "Trusted_Connection=yes;"
-        "Encrypt=yes;"
-        f"TrustServerCertificate={'yes' if trust_cert else 'no'};"
-    )
+def build_conn_str(server, database, trust_cert, driver):
+    """Windows-auth connection string for the chosen ODBC driver."""
+    parts = [
+        f"DRIVER={{{driver}}}",
+        f"SERVER={server}",
+        f"DATABASE={database}",
+        "Trusted_Connection=yes",
+    ]
+    # Encrypt/TrustServerCertificate are only understood by the modern
+    # "ODBC Driver NN for SQL Server" family; older drivers reject them.
+    if driver.startswith("ODBC Driver"):
+        parts.append("Encrypt=yes")
+        parts.append(f"TrustServerCertificate={'yes' if trust_cert else 'no'}")
+    return ";".join(parts) + ";"
 
 
 def resolve_table(cur, schema, table):
@@ -170,18 +199,27 @@ class SqlMonitor:
 
     def _conn_cursor(self):
         if self._conn is None:
+            driver = pick_driver()
+            if driver is None:
+                raise MonitorError(
+                    f"[{_ts()}] No SQL Server ODBC driver found — install "
+                    f"'ODBC Driver 18 for SQL Server'."
+                )
             try:
-                self._conn = pyodbc.connect(
-                    build_conn_str(self.server, self.database, self.trust_cert),
+                conn = pyodbc.connect(
+                    build_conn_str(self.server, self.database,
+                                   self.trust_cert, driver),
                     timeout=10,
                 )
             except pyodbc.Error as e:
                 if "IM002" in str(e):
                     raise MonitorError(
-                        f"[{_ts()}] ODBC driver not found — install "
-                        f"'{ODBC_DRIVER}'."
+                        f"[{_ts()}] ODBC driver '{driver}' could not be loaded "
+                        f"— try installing 'ODBC Driver 18 for SQL Server'."
                     )
                 raise
+            self._conn = conn
+            self.log_cb(f"[{_ts()}] Connected using ODBC driver: {driver}")
         return self._conn.cursor()
 
     def _scalar(self, cur, sql, *params):

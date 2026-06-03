@@ -18,7 +18,7 @@ except ImportError:
     sys.exit(1)
 
 
-VERSION = "v1.2.0"
+VERSION = "v1.2.1"
 AUTHOR = "Gunnthor"
 NTFY_SERVER = "https://ntfy.sh"
 COOLDOWN_SECONDS = 30   # minimum seconds between alerts for the same file

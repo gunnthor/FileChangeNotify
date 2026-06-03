@@ -67,7 +67,7 @@ A second GUI app, `sql_app.py`, watches a **table in a local SQL Server database
 ### Prerequisites
 
 - **SQL Server reachable** from this machine, with a login that has `SELECT` on the table (Windows auth).
-- **ODBC Driver 18 for SQL Server** installed — this is a system component and is **not** bundled into the exe. ([Microsoft download](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server))
+- A **SQL Server ODBC driver** installed (a system component, not bundled into the exe). The app auto-detects whichever is present — preferring "ODBC Driver 18 for SQL Server", then 17/13/11, then the SQL Server Native Client, then the built-in "SQL Server" driver. Driver 18 is recommended ([Microsoft download](https://learn.microsoft.com/sql/connect/odbc/download-odbc-driver-for-sql-server)); on a Dynamics AX/D365 server an older driver is usually already installed and works fine.
 
 ### Run it
 
