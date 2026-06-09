@@ -46,12 +46,22 @@ try:
 except Exception:
     _OS_TRUST = False
 
+# System-tray support (minimize to tray). Optional — without it the window just
+# minimizes to the taskbar as usual.
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    _HAS_TRAY = True
+except Exception:
+    _HAS_TRAY = False
 
-VERSION = "v2.1.0"
+
+VERSION = "v2.3.0"
 AUTHOR = "Gunnthor"
 NTFY_SERVER = "https://ntfy.sh"
 COOLDOWN_SECONDS = 30          # minimum seconds between notifications
 DEFAULT_INTERVAL = 30          # seconds between SQL polls
+MAX_INCLUDE_VALUES = 10        # max field values to list in one notification
 
 # Preferred SQL Server ODBC drivers, best first. We use whichever is installed so
 # the app works on machines without the newest driver (e.g. an AX/D365 VM that only
@@ -113,6 +123,17 @@ def _ts():
 def _clean_err(e):
     msg = str(e)
     return msg if len(msg) <= 200 else msg[:200] + "…"
+
+
+def _make_tray_image():
+    """A simple blue bell icon for the system tray (drawn, no asset file)."""
+    img = Image.new("RGB", (64, 64), HEADER_BG)
+    d = ImageDraw.Draw(img)
+    d.pieslice((18, 12, 46, 38), 180, 360, fill="white")   # bell dome
+    d.rectangle((18, 25, 46, 40), fill="white")            # bell body
+    d.rectangle((15, 40, 49, 45), fill="white")            # rim
+    d.ellipse((28, 45, 36, 53), fill="white")              # clapper
+    return img
 
 
 def pick_driver():
@@ -296,7 +317,7 @@ class FolderHandler(FileSystemEventHandler):
 class SqlMonitor:
     def __init__(self, server, database, schema, table, topic, interval,
                  trust_cert, key_column, log_cb, done_cb, filter_expr=None,
-                 insecure_tls=False):
+                 include_col=None, insecure_tls=False):
         self.server = server
         self.database = database
         self.schema_in = schema
@@ -308,6 +329,7 @@ class SqlMonitor:
         self.log_cb = log_cb
         self.done_cb = done_cb
         self.filter_expr = filter_expr or None
+        self.include_col = include_col or None
         self.insecure_tls = insecure_tls
 
         self._stop = threading.Event()
@@ -395,6 +417,13 @@ class SqlMonitor:
         """' AND (<filter>)' when a filter is set, else ''."""
         return f" AND ({self.filter_expr})" if self.filter_expr else ""
 
+    @staticmethod
+    def _fmt_val(v):
+        if v is None:
+            return "NULL"
+        s = str(v).strip()
+        return s if len(s) <= 120 else s[:120] + "…"
+
     # -- polling --
     def _baseline(self):
         cur = self._conn_cursor()
@@ -416,6 +445,20 @@ class SqlMonitor:
         self.key_col = self.key_in or detect_identity_column(
             cur, self.schema, self.table)
 
+        if self.include_col:
+            if not self.key_col:
+                self.log_cb(f"[{_ts()}] Note: including a column's value needs a key "
+                            f"column — skipping it in row-count mode.")
+                self.include_col = None
+            else:
+                try:
+                    cur.execute(f"SELECT {quote_ident(self.include_col)} "
+                                f"FROM {self._qtable} WHERE 1 = 0")
+                except pyodbc.Error as e:
+                    raise MonitorError(f"[{_ts()}] Column not found: "
+                                       f"{self.include_col} ({_clean_err(e)})")
+                self.log_cb(f"[{_ts()}] Including column in messages: {self.include_col}")
+
         if self.key_col:
             self.mode = "hwm"
             self.last_max = self._scalar(
@@ -432,6 +475,19 @@ class SqlMonitor:
             self.log_cb(f"[{_ts()}] Baseline: {self.last_count} rows in "
                         f"{self.schema}.{self.table} — watching for new rows…")
         self.baselined = True
+
+    def _fetch_values(self, cur):
+        """The chosen column's values for the new rows (newest first, capped)."""
+        col = quote_ident(self.include_col)
+        key = quote_ident(self.key_col)
+        if self.last_max is None:
+            cur.execute(f"SELECT TOP ({MAX_INCLUDE_VALUES}) {col} FROM {self._qtable}"
+                        f"{self._filter_where()} ORDER BY {key} DESC")
+        else:
+            cur.execute(f"SELECT TOP ({MAX_INCLUDE_VALUES}) {col} FROM {self._qtable} "
+                        f"WHERE {key} > ?{self._filter_and()} ORDER BY {key} DESC",
+                        self.last_max)
+        return [self._fmt_val(r[0]) for r in cur.fetchall()]
 
     def _check(self):
         cur = self._conn_cursor()
@@ -454,9 +510,11 @@ class SqlMonitor:
             return
         if not self._cooldown_ok():
             return                      # leave last_max; report cumulatively next time
+        # Fetch the chosen column's values BEFORE advancing the watermark.
+        values = self._fetch_values(cur) if self.include_col else None
         # Advance over ALL rows (keys are monotonic) so we only inspect newer ones.
         new_max = self._scalar(cur, f"SELECT MAX({key}) FROM {self._qtable}")
-        self._notify(n, f"Latest {self.key_col} = {new_max}")
+        self._notify(n, f"Latest {self.key_col} = {new_max}", values)
         self.last_max = new_max
 
     def _check_count(self, cur):
@@ -478,10 +536,15 @@ class SqlMonitor:
         self._last_notified = now
         return True
 
-    def _notify(self, n, detail):
+    def _notify(self, n, detail, values=None):
         ts = _ts()
         title = f"New rows in {self.schema}.{self.table}"
         body = f"{n} new row(s) in {self.schema}.{self.table} at {ts}\n\n{detail}"
+        if values:
+            lines = "\n".join(f"  • {v}" for v in values)
+            body += f"\n\n{self.include_col}:\n{lines}"
+            if n > len(values):
+                body += f"\n  …and {n - len(values)} more"
         if self.filter_expr:
             body += f"\nFilter: {self.filter_expr}"
         try:
@@ -502,10 +565,13 @@ class App(tk.Tk):
         self.monitor = None         # active SqlMonitor
         self.thread = None          # SqlMonitor worker thread
         self._guide_win = None
+        self._tray = None           # pystray Icon (created lazily on first minimize)
         self._build()
         self._switch_mode()
         self._set_running(False)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if _HAS_TRAY:
+            self.bind("<Unmap>", self._on_unmap)
         self._maybe_show_get_started()
 
     def _build(self):
@@ -575,6 +641,7 @@ class App(tk.Tk):
         self.interval_var = tk.StringVar(value=str(DEFAULT_INTERVAL))
         self.trust_var = tk.BooleanVar(value=True)
         self.filter_var = tk.StringVar()
+        self.include_var = tk.StringVar()
 
         def sfield(row, label, var):
             tk.Label(self.sql_frame, text=label, font=("Segoe UI", 9, "bold"),
@@ -632,6 +699,20 @@ class App(tk.Tk):
         tk.Button(self.advanced_frame, text="Test filter", command=self._test_filter,
                   font=("Segoe UI", 9), relief="solid", bd=1, cursor="hand2").grid(
                       row=3, column=0, sticky="w", pady=(8, 0), ipadx=6, ipady=2)
+        tk.Label(self.advanced_frame,
+                 text="Include this column's value in the message (optional)",
+                 font=("Segoe UI", 9, "bold"), bg=BG, fg=LABEL_FG,
+                 anchor="w").grid(row=4, column=0, columnspan=3, sticky="w",
+                                  pady=(14, 4))
+        tk.Entry(self.advanced_frame, textvariable=self.include_var, width=46,
+                 font=("Segoe UI", 9), relief="solid", bd=1).grid(
+                     row=5, column=0, columnspan=3, sticky="ew", ipady=5)
+        tk.Label(self.advanced_frame,
+                 text="e.g.   ErrorMessage   — the value from each new row is added "
+                      "to the push (needs a key/identity column)",
+                 font=("Segoe UI", 8), bg=BG, fg=MUTED_FG, anchor="w",
+                 wraplength=360, justify="left").grid(
+                     row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
         self.advanced_frame.columnconfigure(0, weight=1)
         self.advanced_frame.columnconfigure(1, weight=1)
         self.advanced_frame.grid_remove()       # collapsed by default
@@ -868,10 +949,12 @@ class App(tk.Tk):
                 return
             schema, tbl = split_table(table)
             filt = self.filter_var.get().strip() or None
+            include = self.include_var.get().strip().strip("[]") or None
             self.monitor = SqlMonitor(
                 server, database, schema, tbl, topic, interval,
                 self.trust_var.get(), key, self._log_from_thread,
-                self._on_monitor_exit, filter_expr=filt, insecure_tls=insecure)
+                self._on_monitor_exit, filter_expr=filt, include_col=include,
+                insecure_tls=insecure)
             self.thread = threading.Thread(target=self.monitor.run, daemon=True)
             self.thread.start()
             self._append(f"Monitoring: {schema}.{tbl} on {server}/{database} "
@@ -922,7 +1005,55 @@ class App(tk.Tk):
         self.log.see("end")
         self.log.config(state="disabled")
 
-    def _on_close(self):
+    # ── System tray (minimize to tray) ──────────────────────────────────
+    def _on_unmap(self, event):
+        # Fires when the window is minimized; send it to the tray instead.
+        if event.widget is self and self.state() == "iconic":
+            self._to_tray()
+
+    def _to_tray(self):
+        self.withdraw()                 # remove the taskbar button
+        self._ensure_tray()
+        if self._tray is not None:
+            try:
+                self._tray.visible = True
+            except Exception:
+                pass
+
+    def _ensure_tray(self):
+        if self._tray is not None or not _HAS_TRAY:
+            return
+        try:
+            menu = pystray.Menu(
+                pystray.MenuItem("Show Notifier", self._tray_show, default=True),
+                pystray.MenuItem("Quit", self._tray_quit),
+            )
+            self._tray = pystray.Icon("Notifier", _make_tray_image(),
+                                      "Notifier", menu)
+            self._tray.run_detached()
+        except Exception:
+            self._tray = None           # fall back to normal minimize
+
+    def _restore(self):
+        self.deiconify()
+        self.state("normal")
+        self.lift()
+        self.focus_force()
+        if self._tray is not None:
+            try:
+                self._tray.visible = False
+            except Exception:
+                pass
+
+    # pystray fires these on its own thread → marshal back to the Tk thread.
+    def _tray_show(self, icon=None, item=None):
+        self.after(0, self._restore)
+
+    def _tray_quit(self, icon=None, item=None):
+        self.after(0, self._quit_all)
+
+    # ── Shutdown ─────────────────────────────────────────────────────────
+    def _shutdown_monitors(self):
         if self.observer is not None:
             try:
                 self.observer.stop()
@@ -930,7 +1061,19 @@ class App(tk.Tk):
                 pass
         if self.monitor is not None:
             self.monitor.stop()
+
+    def _quit_all(self):
+        self._shutdown_monitors()
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+            self._tray = None
         self.destroy()
+
+    def _on_close(self):
+        self._quit_all()
 
 
 if __name__ == "__main__":

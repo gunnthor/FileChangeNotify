@@ -1,3 +1,5 @@
 watchdog>=4.0
 pyodbc>=5.1
 truststore>=0.9
+pystray>=0.19
+Pillow>=10

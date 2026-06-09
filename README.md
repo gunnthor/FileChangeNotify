@@ -48,7 +48,7 @@ Download `Notifier.exe` from [Releases](../../releases) and double-click it (or 
 - **Poll interval** and **Trust SQL Server certificate** (leave checked for a local/self-signed instance)
 - **ntfy subscription** — the topic name you subscribed to
 
-Hit **Start Monitoring** and leave the window open.
+Hit **Start Monitoring** and leave it running. **Minimizing sends Notifier to the system tray** (it disappears from the taskbar) and keeps monitoring in the background — right-click the tray icon for **Show Notifier** or **Quit**.
 
 ---
 
@@ -69,6 +69,8 @@ Expand **Advanced** in SQL mode to enter a SQL `WHERE` condition. Only rows matc
 - `LogType IN ('Error','Warning') AND IsHandled = 0`
 
 Use **Test filter** to check it against the table — it reports how many rows match right now, or the exact SQL error. The condition is your own SQL, run as you against your database; it's validated when monitoring starts, and the monitor stops with a clear message if it's invalid. Detection stays insert-based (new rows whose key is higher than the last one seen): the filter narrows *which* new rows notify — it won't re-trigger on updates to older rows.
+
+**Include a column's value in the message.** Also under Advanced, enter a column name (e.g. `ErrorMessage`) to have that field's value from each new row added to the notification — so the push tells you *what* arrived, not just that something did. Up to 10 values are listed per notification (with "…and N more" if there are more). This needs a key/identity column so the app knows which rows are new; the column name is validated at startup.
 
 ### Quick SQL test
 
@@ -96,9 +98,11 @@ python watch.py "C:\path\to\your\folder" your-ntfy-topic
 
 ```bash
 pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --windowed --name Notifier notifier.py
+pyinstaller --onefile --windowed --name Notifier --hidden-import pystray._win32 notifier.py
 # Output: dist/Notifier.exe
 ```
+
+(`--hidden-import pystray._win32` ensures the system-tray backend is bundled, since pystray loads it dynamically.)
 
 ---
 
