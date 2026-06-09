@@ -56,7 +56,7 @@ except Exception:
     _HAS_TRAY = False
 
 
-VERSION = "v2.3.0"
+VERSION = "v2.3.1"
 AUTHOR = "Gunnthor"
 NTFY_SERVER = "https://ntfy.sh"
 COOLDOWN_SECONDS = 30          # minimum seconds between notifications
@@ -206,6 +206,31 @@ def detect_identity_column(cur, schema, table):
     )
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def detect_key_column(cur, schema, table):
+    """Best-effort increasing key when there's no IDENTITY: a single-column
+    integer primary key, else a single-column unique integer index. This finds
+    keys like Dynamics AX/D365 'RecId' (a sequence-backed bigint, not a SQL
+    IDENTITY). Primary keys are preferred."""
+    cur.execute(
+        "SELECT c.name, i.is_primary_key, "
+        "  (SELECT COUNT(*) FROM sys.index_columns ic2 "
+        "   WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id) AS ncols "
+        "FROM sys.indexes i "
+        "JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id "
+        "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+        "JOIN sys.types ty ON ty.user_type_id = c.user_type_id "
+        "WHERE i.object_id = OBJECT_ID(QUOTENAME(?) + N'.' + QUOTENAME(?)) "
+        "  AND (i.is_primary_key = 1 OR i.is_unique = 1) "
+        "  AND ty.name IN ('int','bigint','smallint','tinyint')",
+        schema, table,
+    )
+    cands = [(name, is_pk) for (name, is_pk, ncols) in cur.fetchall() if ncols == 1]
+    if not cands:
+        return None
+    cands.sort(key=lambda x: 0 if x[1] else 1)   # prefer a primary key
+    return cands[0][0]
 
 
 def send_ntfy(topic, title, body, tags, insecure=False):
@@ -444,11 +469,19 @@ class SqlMonitor:
 
         self.key_col = self.key_in or detect_identity_column(
             cur, self.schema, self.table)
+        # If the user wants a column value but there's no IDENTITY, try to find a
+        # usable key (e.g. AX 'RecId') so we can identify the new rows.
+        if self.include_col and not self.key_col:
+            self.key_col = detect_key_column(cur, self.schema, self.table)
+            if self.key_col:
+                self.log_cb(f"[{_ts()}] Using key column '{self.key_col}' "
+                            f"for new-row detection.")
 
         if self.include_col:
             if not self.key_col:
-                self.log_cb(f"[{_ts()}] Note: including a column's value needs a key "
-                            f"column — skipping it in row-count mode.")
+                self.log_cb(f"[{_ts()}] ⚠ Can't include '{self.include_col}': no "
+                            f"identity/primary key found. Set a Key column "
+                            f"(e.g. RecId) under Advanced.")
                 self.include_col = None
             else:
                 try:
@@ -545,8 +578,6 @@ class SqlMonitor:
             body += f"\n\n{self.include_col}:\n{lines}"
             if n > len(values):
                 body += f"\n  …and {n - len(values)} more"
-        if self.filter_expr:
-            body += f"\nFilter: {self.filter_expr}"
         try:
             send_ntfy(self.topic, title, body, "inbox_tray", self.insecure_tls)
             self.log_cb(f"[{ts}] {n} new row(s) — notification sent.")
@@ -709,7 +740,7 @@ class App(tk.Tk):
                      row=5, column=0, columnspan=3, sticky="ew", ipady=5)
         tk.Label(self.advanced_frame,
                  text="e.g.   ErrorMessage   — the value from each new row is added "
-                      "to the push (needs a key/identity column)",
+                      "to the push (uses the identity/primary key; or set Key column above)",
                  font=("Segoe UI", 8), bg=BG, fg=MUTED_FG, anchor="w",
                  wraplength=360, justify="left").grid(
                      row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))

@@ -70,7 +70,9 @@ Expand **Advanced** in SQL mode to enter a SQL `WHERE` condition. Only rows matc
 
 Use **Test filter** to check it against the table — it reports how many rows match right now, or the exact SQL error. The condition is your own SQL, run as you against your database; it's validated when monitoring starts, and the monitor stops with a clear message if it's invalid. Detection stays insert-based (new rows whose key is higher than the last one seen): the filter narrows *which* new rows notify — it won't re-trigger on updates to older rows.
 
-**Include a column's value in the message.** Also under Advanced, enter a column name (e.g. `ErrorMessage`) to have that field's value from each new row added to the notification — so the push tells you *what* arrived, not just that something did. Up to 10 values are listed per notification (with "…and N more" if there are more). This needs a key/identity column so the app knows which rows are new; the column name is validated at startup.
+**Include a column's value in the message.** Also under Advanced, enter a column name (e.g. `ErrorMessage`) to have that field's value from each new row added to the notification — so the push tells you *what* arrived, not just that something did. Up to 10 values are listed per notification (with "…and N more" if there are more), and the column name is validated at startup.
+
+This needs a key column so the app knows which rows are new. It uses the table's `IDENTITY` column automatically; if there isn't one, it falls back to a single-column integer primary/unique key (this finds Dynamics AX/D365 `RecId`, which is a sequence rather than a SQL identity). If your table has neither, set the **Key column** field (e.g. `RecId`) yourself.
 
 ### Quick SQL test
 
